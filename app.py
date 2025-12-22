@@ -117,8 +117,8 @@ if 'watchlist' not in st.session_state:
 
 # --- CACHING WRAPPERS ---
 @st.cache_data(ttl=300) # Cache for 5 minutes
-def get_analysis(ticker, period, interval, api_key):
-    return analysis.analyze_stock_comprehensive(ticker, period, interval, api_key)
+def get_analysis(ticker, period, interval, market_type, api_key):
+    return analysis.analyze_stock_comprehensive(ticker, period, interval, market_type, api_key)
 
 @st.cache_data(ttl=3600) # Cache ticker resolution for 1 hour
 def resolve_ticker(query, market_type):
@@ -187,6 +187,10 @@ with st.sidebar:
     
     st.markdown("---")
     st.info(f"**Mode:** {market_type} Market\n**Strategy:** {tf_label}")
+    
+    st.markdown("---")
+    st.caption("Created by **Preet Sethiya** | Roll: 250834")
+    st.caption("⚠️ **Disclaimer:** This analysis is purely for educational purposes and not an investment suggestion. It is purely algorithmic and no one is responsible for its validity.")
 
 # --- MAIN APP ---
 if not ticker_input:
@@ -249,7 +253,7 @@ elif run_btn or ticker_input:
 
         # 2. Main Analysis Layer
         with st.spinner(f"Crunching numbers for {resolved_ticker}..."):
-            df, result, news, ai_insight, pattern_df = get_analysis(resolved_ticker, period, interval, api_key)
+            df, result, news, ai_insight, pattern_df = get_analysis(resolved_ticker, period, interval, market_type, api_key)
             
         # 2a. Backtesting Layer
         backtest_res = run_backtest(df)
@@ -305,11 +309,16 @@ elif run_btn or ticker_input:
                     theme_color = "#FFC400" # Amber
                     glow_color = "rgba(255, 196, 0, 0.4)"
                 
+                # Warnings
+                if result.get('warnings'):
+                    for w in result['warnings']:
+                        st.markdown(f"<p style='color: #ffaa00; font-size: 13px; text-align: center; margin: 0;'>{w}</p>", unsafe_allow_html=True)
+                
                 st.markdown(f"""
                 <div class="metric-container" style="border-top: 5px solid {theme_color}; box-shadow: 0 0 30px {glow_color};">
                     <div style="color: #aaa; letter-spacing: 2px; font-size: 14px; text-transform: uppercase;">Technical Consensus</div>
                     <div class="big-verdict" style="color: {theme_color};">{decision}</div>
-                    <div class="confidence-score">Confidence Level: {confidence}%</div>
+                    <div class="confidence-score">Confidence Level: {int(confidence)}%</div>
                     <div style="margin-top: 15px; font-size: 12px; color: #888;">
                         Analyzed {len(result['table_data'])} Indicators • {len(result['drivers']['bullish'])} Bullish signals vs {len(result['drivers']['bearish'])} Bearish
                     </div>
@@ -338,60 +347,94 @@ elif run_btn or ticker_input:
             
             # --- TAB 1: CHARTS ---
             with tab1:
-                # Range Logic
+                # 1. Viewport Slicing (Display specific historical window while keeping full data for analysis)
+                # This ensures charts are readable (not 20 years of daily data squeezed in)
+                
+                slice_window = len(df) # Default to all
+                if interval == '1d': slice_window = 252 # Approx 1 Trading Year
+                elif interval == '1wk': slice_window = 156 # Approx 3 Years
+                elif interval == '1mo': slice_window = 120 # Approx 10 Years
+                elif interval in ['5m', '15m', '30m', '1h']: slice_window = 300 # Recent Intraday candles
+                
+                # Create Display DF
+                df_chart = df.tail(slice_window).copy()
+
+                # 2. Range Breaks Logic (Dynamic)
                 range_breaks = []
-                if interval in ['1d', '1wk']:
-                    range_breaks = [dict(bounds=["sat", "mon"])]
+                if market_type != "Crypto" and interval in ['1d', '1wk']:
+                     range_breaks = [dict(bounds=["sat", "mon"])] # Hide weekends for non-crypto
                 
-                # Main Price Chart
-                fig = go.Figure()
-                fig.add_trace(go.Candlestick(x=df.index, open=df['Open'], high=df['High'], low=df['Low'], close=df['Close'], name='Price'))
+                # 3. Main Chart Layout (Price + Volume)
+                fig = make_subplots(
+                    rows=2, cols=1, 
+                    shared_xaxes=True, 
+                    vertical_spacing=0.05, 
+                    row_heights=[0.75, 0.25]
+                )
                 
-                # Overlays
-                if 'SMA_50' in df.columns: fig.add_trace(go.Scatter(x=df.index, y=df['SMA_50'], line=dict(color='orange', width=1.5), name='SMA 50'))
-                if 'SMA_200' in df.columns: fig.add_trace(go.Scatter(x=df.index, y=df['SMA_200'], line=dict(color='#2979FF', width=2), name='SMA 200'))
-                if 'VWAP_D' in df.columns: fig.add_trace(go.Scatter(x=df.index, y=df['VWAP_D'], line=dict(color='#FFD700', dash='dot'), name='VWAP'))
+                # Candlestick (Row 1)
+                fig.add_trace(go.Candlestick(
+                    x=df_chart.index, open=df_chart['Open'], high=df_chart['High'], low=df_chart['Low'], close=df_chart['Close'], 
+                    name='Price'
+                ), row=1, col=1)
                 
-                fig.update_layout(height=500, xaxis_rangeslider_visible=False, template="plotly_dark", 
-                                title=dict(text="Price Action & Trend", font=dict(size=20)),
-                                margin=dict(l=0, r=0, t=40, b=0),
-                                hovermode="x unified",
-                                xaxis_rangebreaks=range_breaks,
-                                paper_bgcolor='rgba(0,0,0,0)', plot_bgcolor='rgba(0,0,0,0)')
+                # Overlays (Row 1)
+                if 'SMA_50' in df_chart.columns: 
+                    fig.add_trace(go.Scatter(x=df_chart.index, y=df_chart['SMA_50'], line=dict(color='orange', width=1.5), name='SMA 50'), row=1, col=1)
+                if 'SMA_200' in df_chart.columns: 
+                    fig.add_trace(go.Scatter(x=df_chart.index, y=df_chart['SMA_200'], line=dict(color='#2979FF', width=2), name='SMA 200'), row=1, col=1)
+                if 'VWAP_D' in df_chart.columns: 
+                    fig.add_trace(go.Scatter(x=df_chart.index, y=df_chart['VWAP_D'], line=dict(color='#FFD700', dash='dot'), name='VWAP'), row=1, col=1)
+                if 'BBU_20_2.0' in df_chart.columns:
+                     fig.add_trace(go.Scatter(x=df_chart.index, y=df_chart['BBU_20_2.0'], line=dict(color='rgba(255, 255, 255, 0.3)', width=1, dash='dot'), name='Upper Band', showlegend=False), row=1, col=1)
+                     fig.add_trace(go.Scatter(x=df_chart.index, y=df_chart['BBL_20_2.0'], line=dict(color='rgba(255, 255, 255, 0.3)', width=1, dash='dot'), name='Lower Band', fill='tonexty', fillcolor='rgba(255, 255, 255, 0.05)', showlegend=False), row=1, col=1)
+
+                # Volume (Row 2) - Color coded
+                colors = ['#00ff00' if row['Open'] - row['Close'] >= 0 else '#ff0000' for index, row in df_chart.iterrows()]
+                fig.add_trace(go.Bar(
+                    x=df_chart.index, y=df_chart['Volume'], 
+                    marker_color=colors, 
+                    name='Volume',
+                    opacity=0.5
+                ), row=2, col=1)
+                
+                # Layout Polish
+                fig.update_layout(
+                    height=600, 
+                    xaxis_rangeslider_visible=False, 
+                    template="plotly_dark",
+                    title=dict(text=f"{resolved_ticker} Price & Volume ({interval})", font=dict(size=18)),
+                    margin=dict(l=0, r=0, t=40, b=0),
+                    hovermode="x unified",
+                    xaxis_rangebreaks=range_breaks,
+                    paper_bgcolor='rgba(0,0,0,0)', 
+                    plot_bgcolor='rgba(0,0,0,0)',
+                    legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1)
+                )
+                
+                # Y-Axis Formatting
+                fig.update_yaxes(title_text="Price", row=1, col=1)
+                fig.update_yaxes(title_text="Vol", row=2, col=1, showgrid=False)
+                
                 st.plotly_chart(fig, use_container_width=True)
                 
-                # Momentum Split
-                c_m1, c_m2 = st.columns(2)
-                with c_m1:
-                    # MACD/RSI
-                    fig2 = make_subplots(rows=2, cols=1, shared_xaxes=True, row_heights=[0.5, 0.5], vertical_spacing=0.08)
-                    fig2.add_trace(go.Scatter(x=df.index, y=df['RSI_14'], line=dict(color='#AA00FF'), name='RSI'), row=1, col=1)
-                    fig2.add_hline(y=70, row=1, col=1, line_dash="dash", line_color="rgba(255,0,0,0.5)")
-                    fig2.add_hline(y=30, row=1, col=1, line_dash="dash", line_color="rgba(0,255,0,0.5)")
+                # 3. Momentum Panel (Separate Expander to save space)
+                with st.expander("📉 Momentum Indicators (MACD, RSI, Stoch)", expanded=True):
+                    # Normalized Momentum Chart (RSI + Stoch)
+                    fig_mom = make_subplots(rows=2, cols=1, shared_xaxes=True, row_heights=[0.5, 0.5])
                     
-                    fig2.add_trace(go.Scatter(x=df.index, y=df['MACD_12_26_9'], line=dict(color='#00E5FF'), name='MACD'), row=2, col=1)
-                    fig2.add_trace(go.Scatter(x=df.index, y=df['MACDs_12_26_9'], line=dict(color='#FF6D00'), name='Signal'), row=2, col=1)
-                    fig2.add_bar(x=df.index, y=df['MACDh_12_26_9'], name='Hist', marker_color='gray', row=2, col=1)
+                    # RSI
+                    fig_mom.add_trace(go.Scatter(x=df_chart.index, y=df_chart.get('RSI_14'), line=dict(color='#AA00FF'), name='RSI'), row=1, col=1)
+                    fig_mom.add_hline(y=70, row=1, col=1, line_dash="dash", line_color="red")
+                    fig_mom.add_hline(y=30, row=1, col=1, line_dash="dash", line_color="green")
                     
-                    fig2.update_layout(height=350, template="plotly_dark", showlegend=False, 
-                                    margin=dict(l=0, r=0, t=10, b=0),
-                                    paper_bgcolor='rgba(0,0,0,0)', plot_bgcolor='rgba(0,0,0,0)',
-                                    xaxis_rangebreaks=range_breaks)
-                    st.plotly_chart(fig2, use_container_width=True)
+                    # MACD
+                    fig_mom.add_trace(go.Scatter(x=df_chart.index, y=df_chart.get('MACD_12_26_9'), line=dict(color='#00E5FF'), name='MACD'), row=2, col=1)
+                    fig_mom.add_trace(go.Scatter(x=df_chart.index, y=df_chart.get('MACDs_12_26_9'), line=dict(color='#FF6D00'), name='Signal'), row=2, col=1)
+                    fig_mom.add_bar(x=df_chart.index, y=df_chart.get('MACDh_12_26_9'), name='Hist', marker_color='gray', row=2, col=1)
                     
-                with c_m2:
-                    # Stochastic
-                    if 'STOCHk_14_3_3' in df.columns:
-                        fig3 = go.Figure()
-                        fig3.add_trace(go.Scatter(x=df.index, y=df['STOCHk_14_3_3'], line=dict(color='#00B0FF'), name='Stoch K'))
-                        fig3.add_trace(go.Scatter(x=df.index, y=df['STOCHd_14_3_3'], line=dict(color='#FF1744'), name='Stoch D'))
-                        fig3.add_hline(y=80, line_dash="dot", line_color="gray")
-                        fig3.add_hline(y=20, line_dash="dot", line_color="gray")
-                        fig3.update_layout(height=350, title="Stochastic Oscillator", template="plotly_dark",
-                                        margin=dict(l=0, r=0, t=30, b=0),
-                                        paper_bgcolor='rgba(0,0,0,0)', plot_bgcolor='rgba(0,0,0,0)',
-                                        xaxis_rangebreaks=range_breaks)
-                        st.plotly_chart(fig3, use_container_width=True)
+                    fig_mom.update_layout(height=400, template="plotly_dark", margin=dict(t=10, b=0, l=0, r=0), paper_bgcolor='rgba(0,0,0,0)', plot_bgcolor='rgba(0,0,0,0)', xaxis_rangebreaks=range_breaks)
+                    st.plotly_chart(fig_mom, use_container_width=True)
 
             # --- TAB 2: DATA TABLE ---
             with tab2:
@@ -467,13 +510,26 @@ elif run_btn or ticker_input:
                         
                         # Native Streamlit Components for Robustness
                         with st.container():
+                            n_trades = backtest_res['total_trades']
+                            win_rate = backtest_res['win_rate']
+                            
+                            # Color Logic
+                            wr_color = "#00ff00" if win_rate > 50 else "#ff4444"
+                            if n_trades < 30:
+                                wr_color = "#ffaa00" # Orange warning color for low sample
+                            
                             st.markdown(f"""
                             <div class="prob-card">
                                 <div style="font-size: 14px; color: #888; margin-bottom: 5px;">HISTORICAL WIN RATE</div>
-                                <div style="font-size: 36px; font-weight: 800; color: {wr_color}; line-height: 1;">{win_rate}%</div>
-                                <div style="font-size: 12px; color: #aaa; margin-bottom: 15px;">{backtest_res['total_trades']} trades (1Y)</div>
+                                <div style="font-size: 36px; font-weight: 800; color: {wr_color}; line-height: 1;">
+                                    {win_rate}% <span style="font-size: 16px; color: #aaa; font-weight: 400;">(N={n_trades})</span>
+                                </div>
+                                <div style="font-size: 12px; color: #aaa; margin-bottom: 15px;">Simulated past performance (with 0.1% fees)</div>
                             </div>
                             """, unsafe_allow_html=True)
+                            
+                            if n_trades < 30:
+                                st.markdown("⚠️ <span style='color: #ff4444; font-weight: bold;'>Sample size too small for reliable probability</span>", unsafe_allow_html=True)
                             
                             # Metrics Row
                             m1, m2, m3 = st.columns(3)
@@ -482,8 +538,12 @@ elif run_btn or ticker_input:
                             with m2:
                                 st.metric("Max DD", f"{backtest_res['max_drawdown']}%", border=True)
                             with m3:
-                                st.metric("Avg Profit", f"{backtest_res['avg_profit']}%", border=True)
-                                
+                                st.metric("Sharpe", f"{backtest_res.get('sharpe_ratio', 'N/A')}", border=True)
+                            
+                            # Warning Label
+                            if backtest_res.get('warning'):
+                                st.caption(f"⚠️ {backtest_res['warning']}")
+
                             # Best Scenario (Simple Text)
                             if backtest_res['best_trade']:
                                 entry_d = backtest_res['best_trade']['entry_date'].strftime('%Y-%m-%d')

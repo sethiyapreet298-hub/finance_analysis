@@ -2,5 +2,5 @@ streamlit
 yfinance
 pandas_ta
 plotly
-duckduckgo-search
+ddgs
 google-generativeai

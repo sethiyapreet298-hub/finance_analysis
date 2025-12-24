@@ -16,15 +16,16 @@ def fetch_data(ticker, period="2y", interval="1d"):
         # 1h: max 730d
         limit_period = period
         if interval in ['1m', '2m', '5m', '15m', '30m', '90m']:
-            limit_period = "59d" # Safe buffer
+            limit_period = "60d" # Max for Yahoo Intraday
         elif interval == '1h':
-            limit_period = "729d" # Safe buffer
+            limit_period = "730d" 
+        elif interval in ['1d', '1wk', '1mo']:
+             limit_period = "max" # Get full history for Backtesting
 
         stock = yf.Ticker(ticker)
         df = stock.history(period=limit_period, interval=interval)
         
         if df.empty:
-            # Fallback for some indices or messy tickers
             return None
             
         return df
@@ -32,25 +33,7 @@ def fetch_data(ticker, period="2y", interval="1d"):
         print(f"Error fetching data: {e}")
         return None
 
-def get_market_news(ticker, max_results=5):
-    """
-    Searches for latest news about the ticker using DuckDuckGo.
-    Returns a list of dictionaries with 'title', 'link', 'source'.
-    """
-    try:
-        results = DDGS().text(f"{ticker} stock news analysis why moving today", max_results=max_results)
-        news_items = []
-        if results:
-            for r in results:
-                news_items.append({
-                    "title": r.get('title'),
-                    "link": r.get('href'),
-                    "snippet": r.get('body'),
-                })
-        return news_items
-    except Exception as e:
-        print(f"Search error: {e}")
-        return []
+
 
 def get_ai_insight(api_key, ticker, technical_summary, news_items):
     """
@@ -87,7 +70,36 @@ def get_ai_insight(api_key, ticker, technical_summary, news_items):
     except Exception as e:
         return f"AI Analysis Failed: {e}"
 
-def calculate_expert_score(df, interval="1d"):
+def get_market_regime(market_type):
+    """
+    Checks the broad market trend (SPY, NIFTY, BTC) to filter signals.
+    Returns: 'BULLISH', 'BEARISH', or 'NEUTRAL'
+    """
+    try:
+        ticker_map = {
+            "US": "SPY",
+            "India": "^NSEI",
+            "Crypto": "BTC-USD",
+            "Commodities": "GC=F" # Gold as general sentiment proxy? Or maybe simple Neutral.
+        }
+        
+        index_ticker = ticker_map.get(market_type, "SPY")
+        df = yf.Ticker(index_ticker).history(period="1y", interval="1d")
+        
+        if df.empty or len(df) < 200:
+            return "NEUTRAL"
+            
+        current_price = df['Close'].iloc[-1]
+        sma_200 = df['Close'].rolling(window=200).mean().iloc[-1]
+        
+        if current_price > sma_200:
+            return "BULLISH"
+        else:
+            return "BEARISH"
+    except:
+        return "NEUTRAL"
+
+def calculate_expert_score(df, interval="1d", market_type="US"):
     """
     Calculates a comprehensive technical score with confidence logic and detailed breakdown.
     Returns at least 10 indicators with accurate values, sorted by reliability/impact.
@@ -111,7 +123,13 @@ def calculate_expert_score(df, interval="1d"):
     
     # 2. Trend
     df.ta.sma(length=50, append=True)
-    df.ta.sma(length=200, append=True)
+    
+    # Adaptive Logic for SMA 200
+    has_sma200 = False
+    if len(df) >= 200:
+        df.ta.sma(length=200, append=True)
+        has_sma200 = True
+        
     df.ta.ema(length=9, append=True)  # Fast EMA
     df.ta.ema(length=20, append=True) # Short Trend
     df.ta.adx(length=14, append=True)
@@ -169,139 +187,205 @@ def calculate_expert_score(df, interval="1d"):
     
     vwap = get_last('VWAP') if has_vwap else None
 
-    # --- SCORING & INSIGHT ENGINE ---
-    score = 0
-    max_score = 0
+    # --- SCORING ENGINE (WEIGHTED GROUPS) ---
+    # Weights: Trend (40%), Momentum (30%), Volatility (10%), Volume (20%)
+    
+    score_trend = 0
+    score_momentum = 0
+    score_volatility = 0
+    score_volume = 0
     
     bullish_factors = []
     bearish_factors = []
     neutral_factors = []
-    
-    # List to store full details for the table
-    # Schema: {Indicator, Value, Signal, Impact(1-10), Reason}
     details = []
     
-    def analyze(ind_name, val, weight, bullish_cond, bearish_cond, bull_r, bear_r, neutral_r):
-        nonlocal score, max_score
-        max_score += weight
-        
-        sig = "NEUTRAL"
-        reason = neutral_r
-        
-        if bullish_cond:
-            score += weight
-            sig = "BULLISH"
-            reason = bull_r
-            bullish_factors.append(f"{ind_name}: {bull_r}")
-        elif bearish_cond:
-            score -= weight
-            sig = "BEARISH"
-            reason = bear_r
-            bearish_factors.append(f"{ind_name}: {bear_r}")
-        else:
-            neutral_factors.append(f"{ind_name}: {neutral_r}")
-            
-        # Format Value
-        val_str = f"{val:.2f}" if isinstance(val, (int, float)) else str(val)
-        
+    def log_detail(name, val, sig, impact, note):
         details.append({
-            "Indicator": ind_name,
-            "Value": val_str,
+            "Indicator": name,
+            "Value": f"{val:.2f}" if isinstance(val, (int, float)) else str(val),
             "Signal": sig,
-            "Reliability": weight,
-            "Note": reason
+            "Reliability": impact,
+            "Note": note
         })
+        if sig == "BULLISH": bullish_factors.append(f"{name}: {note}")
+        elif sig == "BEARISH": bearish_factors.append(f"{name}: {note}")
+        else: neutral_factors.append(f"{name}: {note}")
 
-    # --- 1. TREND (High Reliability) ---
+    # --- GROUP A: TREND (40%) ---
+    # SMA 200, EMA 20, ADX
+    # Max Trend Score: 10
+    
+    # 1. Long Term Trend (SMA 200) -> 4 pts
     if sma_200:
-        analyze("SMA 200 (Long Term)", sma_200, 10, 
-                current_price > sma_200, current_price < sma_200, 
-                "Price > SMA 200 (Uptrend)", "Price < SMA 200 (Downtrend)", "At SMA Level")
-                
+        if current_price > sma_200:
+            score_trend += 4
+            log_detail("SMA 200 (Trend)", sma_200, "BULLISH", 10, "Price > SMA 200 (Uptrend)")
+        elif current_price < sma_200:
+            score_trend -= 4
+            log_detail("SMA 200 (Trend)", sma_200, "BEARISH", 10, "Price < SMA 200 (Downtrend)")
+        else:
+            log_detail("SMA 200 (Trend)", sma_200, "NEUTRAL", 10, "Price at SMA 200")
+
+    # 2. Short Term Trend (EMA 20) -> 3 pts
     if ema_20:
-        analyze("EMA 20 (Short Term)", ema_20, 8,
-                current_price > ema_20, current_price < ema_20,
-                "Price > EMA 20 (Strong Momentum)", "Price < EMA 20 (Weak Momentum)", "Consolidating")
-
-    if macd_val is not None and macd_sig is not None:
-        analyze("MACD (12,26,9)", macd_val - macd_sig, 8,
-                macd_val > macd_sig, macd_val < macd_sig,
-                "Histogram Positive (Bullish)", "Histogram Negative (Bearish)", "Flat")
-
+        if current_price > ema_20:
+            score_trend += 3
+            log_detail("EMA 20 (Momentum)", ema_20, "BULLISH", 8, "Price > EMA 20")
+        elif current_price < ema_20:
+            score_trend -= 3
+            log_detail("EMA 20 (Momentum)", ema_20, "BEARISH", 8, "Price < EMA 20")
+            
+    # 3. Trend Strength (ADX) -> 3 pts
     if adx:
-        trend_str = "Strong" if adx > 25 else "Weak"
-        # ADX doesn't give direction, just strength. We combine with EMA for direction context
-        direction = "Bullish" if (ema_20 and current_price > ema_20) else "Bearish"
-        analyze("ADX (Trend Strength)", adx, 7,
-                adx > 25 and direction == "Bullish", adx > 25 and direction == "Bearish",
-                "Strong Uptrend Strength", "Strong Downtrend Strength", "Weak Trend (<25)")
+        trend_dir = "BULLISH" if (ema_20 and current_price > ema_20) else "BEARISH"
+        if adx > 25:
+            if trend_dir == "BULLISH":
+                score_trend += 3
+                log_detail("ADX Strength", adx, "BULLISH", 7, "Strong Uptrend")
+            else:
+                score_trend -= 3
+                log_detail("ADX Strength", adx, "BEARISH", 7, "Strong Downtrend")
+        else:
+            log_detail("ADX Strength", adx, "NEUTRAL", 5, "Weak Trend (<25)")
 
-    if psar_l or psar_s:
-        # PSAR logic: if PSARl exists (Long), price is above dots. If PSARs (Short), price below.
-        val = psar_l if psar_l else psar_s
-        is_bull = psar_l is not None and psar_l > 0
-        analyze("Parabolic SAR", val, 6,
-                is_bull, not is_bull,
-                "Dots below price (Buy)", "Dots above price (Sell)", "N/A")
+    # Normalize Trend Score to 40% (Range -10 to +10 maps to -40 to +40)
+    final_trend = score_trend * 4 
 
-    # --- 2. MOMENTUM (Medium Reliability / Timing) ---
+    # --- GROUP B: MOMENTUM (30%) ---
+    # RSI, Stoch, MACD, CCI. VOTE SYSTEM: 1 Vote Max.
+    # Logic: Count Bullish vs Bearish signals. Majority wins the full 30 points.
+    
+    mom_bull = 0
+    mom_bear = 0
+    
+    # RSI
     if rsi:
-        analyze("RSI (14)", rsi, 9,
-                rsi < 30, rsi > 70,
-                "Oversold (<30)", "Overbought (>70)", "Neutral Zone (30-70)")
-                
+        if rsi < 30: 
+            mom_bull += 1
+            log_detail("RSI (14)", rsi, "BULLISH", 9, "Oversold (<30)")
+        elif rsi > 70: 
+            mom_bear += 1
+            log_detail("RSI (14)", rsi, "BEARISH", 9, "Overbought (>70)")
+        else:
+            log_detail("RSI (14)", rsi, "NEUTRAL", 6, "Neutral Zone")
+            
+    # Stoch
     if stoch_k:
-        analyze("Stochastic %K", stoch_k, 7,
-                stoch_k < 20, stoch_k > 80,
-                "Oversold (<20)", "Overbought (>80)", "Neutral")
-                
-    if cci:
-        analyze("CCI (20)", cci, 6,
-                cci < -100, cci > 100,
-                "Oversold (<-100)", "Overbought (>100)", "Neutral")
+        if stoch_k < 20: 
+            mom_bull += 1
+            log_detail("Stochastic", stoch_k, "BULLISH", 7, "Oversold (<20)")
+        elif stoch_k > 80: 
+            mom_bear += 1
+            log_detail("Stochastic", stoch_k, "BEARISH", 7, "Overbought (>80)")
+        else:
+            log_detail("Stochastic", stoch_k, "NEUTRAL", 5, "Neutral")
 
-    if willr:
-        analyze("Williams %R", willr, 6,
-                willr < -80, willr > -20,
-                "Oversold (<-80)", "Overbought (>-20)", "Neutral")
-
-    # --- 3. VOLUME & VOLATILITY (Confirmation) ---
+    # MACD
+    if macd_val is not None and macd_sig is not None:
+        if macd_val > macd_sig:
+            mom_bull += 1
+            log_detail("MACD", macd_val-macd_sig, "BULLISH", 8, "Bullish Crossover/Hist")
+        else:
+            mom_bear += 1
+            log_detail("MACD", macd_val-macd_sig, "BEARISH", 8, "Bearish Crossover/Hist")
+            
+    # Calculate Momentum Score
+    final_momentum = 0
+    if mom_bull > mom_bear:
+        final_momentum = 30
+    elif mom_bear > mom_bull:
+        final_momentum = -30
+        
+    # --- GROUP C: VOLUME (20%) ---
+    # OBV, MFI, CMF
+    
+    vol_score_raw = 0
+    # MFI -> 7 pts
     if mfi:
-        analyze("MFI (Money Flow)", mfi, 7,
-                mfi < 20, mfi > 80,
-                "Smart Money Buying (Oversold)", "Smart Money Selling (Overbought)", "Neutral Flow")
-                
+        if mfi < 20: 
+            vol_score_raw += 7
+            log_detail("MFI (Money Flow)", mfi, "BULLISH", 7, "Smart Money Buying")
+        elif mfi > 80: 
+            vol_score_raw -= 7
+            log_detail("MFI (Money Flow)", mfi, "BEARISH", 7, "Smart Money Selling")
+        else:
+            log_detail("MFI (Money Flow)", mfi, "NEUTRAL", 5, "Neutral Flow")
+            
+    # CMF -> 7 pts
     if cmf:
-        analyze("Chaikin Money Flow", cmf, 6,
-                cmf > 0.05, cmf < -0.05,
-                "Inflows (Buying Pressure)", "Outflows (Selling Pressure)", "Neutral")
-                
+        if cmf > 0.05: 
+            vol_score_raw += 7
+            log_detail("Chaikin Money Flow", cmf, "BULLISH", 6, "Inflows (Accumulation)")
+        elif cmf < -0.05: 
+            vol_score_raw -= 7
+            log_detail("Chaikin Money Flow", cmf, "BEARISH", 6, "Outflows (Distribution)")
+        else:
+            log_detail("Chaikin Money Flow", cmf, "NEUTRAL", 5, "Neutral")
+
+    # OBV Slope -> 6 pts
+    if obv is not None and len(df) > 20:
+        obv_series = df['OBV']
+        obv_ema = obv_series.ewm(span=20).mean().iloc[-1]
+        if obv > obv_ema:
+            vol_score_raw += 6
+            log_detail("On-Balance Volume", obv, "BULLISH", 6, "Volume Trend Rising")
+        else:
+            vol_score_raw -= 6
+            log_detail("On-Balance Volume", obv, "BEARISH", 6, "Volume Trend Falling")
+
+    final_volume = vol_score_raw 
+    
+    # --- GROUP D: VOLATILITY (10%) ---
+    # BBands, ATR, VIX
+    
+    final_volatility = 0
+    
+    # 1. Bollinger Bands -> 4 pts
     if bb_upper and bb_lower:
-        # Volatility squeeze or breakout?
-        # Simple Mean Reversion logic
-        analyze("Bollinger Bands", current_price, 6,
-                current_price < bb_lower, current_price > bb_upper,
-                "Price at Lower Band (Support)", "Price at Upper Band (Resistance)", "Inside Bands")
-                
-    if obv:
-        # OBV is relative, harder to give a single signal without slope. 
-        # We'll just display it with neutral weight unless we calc slope (omitted for speed)
-        analyze("On-Balance Volume", obv, 4, False, False, "", "", "Cumulative Volume Metric")
-
+        if current_price < bb_lower:
+            final_volatility += 4
+            log_detail("Bollinger Bands", current_price, "BULLISH", 6, "Price at Support")
+        elif current_price > bb_upper:
+            final_volatility -= 4
+            log_detail("Bollinger Bands", current_price, "BEARISH", 6, "Price at Resistance")
+        else:
+            log_detail("Bollinger Bands", current_price, "NEUTRAL", 5, "Inside Bands")
+            
+    # 2. ATR -> 3 pts
     if atr:
-         analyze("ATR (Volatility)", atr, 5, False, False, "", "", f"Daily Range is +/- {atr:.2f}")
+        atr_pct = (atr / current_price) * 100
+        if atr_pct > 3.0:
+            final_volatility -= 3
+            log_detail("ATR (Volatility)", atr, "BEARISH", 4, f"High Volatility ({atr_pct:.1f}%)")
+        else:
+            final_volatility += 3
+            log_detail("ATR (Volatility)", atr, "NEUTRAL", 4, f"Normal Volatility ({atr_pct:.1f}%)")
 
-    if vwap:
-        analyze("VWAP (Intraday)", vwap, 8,
-                current_price > vwap, current_price < vwap,
-                "Price > VWAP (Bullish Control)", "Price < VWAP (Bearish Control)", "At VWAP")
+    # 3. VIX -> 3 pts
+    vix_ticker = "^VIX" if market_type == "US" else "^INDIAVIX" if market_type == "India" else None
+    if vix_ticker:
+        try:
+            vix_df = yf.Ticker(vix_ticker).history(period="5d")
+            if not vix_df.empty:
+                vix_val = vix_df['Close'].iloc[-1]
+                if vix_val > 30:
+                    final_volatility -= 3
+                    log_detail(f"VIX ({market_type})", vix_val, "BEARISH", 8, "Extreme Fear (>30)")
+                elif vix_val < 20:
+                    final_volatility += 3
+                    log_detail(f"VIX ({market_type})", vix_val, "BULLISH", 8, "Market Stable (<20)")
+                else:
+                    log_detail(f"VIX ({market_type})", vix_val, "NEUTRAL", 5, "Normal Regime")
+        except:
+             pass
 
-    # --- FINAL SORTING ---
-    # Sort by Reliability (High to Low), then by Signal Interest (Bull/Bear first)
-    details.sort(key=lambda x: x['Reliability'], reverse=True)
-
-    # --- DECISION LOGIC ---
-    normalized_score = ((score + max_score) / (2 * max_score)) * 100 if max_score > 0 else 50
+    # --- FINAL AGGREGATION ---
+    total_score = final_trend + final_momentum + final_volume + final_volatility
+    # Range: -100 to +100
+    
+    # Normalize to 0-100 for display
+    normalized_score = (total_score + 100) / 2
     
     decision = "HOLD"
     if normalized_score >= 60: decision = "BUY"
@@ -314,12 +398,30 @@ def calculate_expert_score(df, interval="1d"):
     elif 25 < normalized_score <= 40: strength = "MODERATE"
     elif normalized_score <= 25: strength = "STRONG"
     
-    full_decision = f"{strength} {decision}" if decision != "HOLD" else "HOLD"
+    # --- MARKET REGIME FILTER ---
+    # Downgrade STRONG BUY in Bear Market
+    regime = get_market_regime(market_type)
+    regime_msg = ""
+    
+    warnings = []
+    if len(df) < 200:
+        warnings.append("⚠️ Data limited: Switched to Short-Term Analysis (50-SMA) due to lack of history.")
+    
+    if regime == "BEARISH" and "STRONG BUY" in f"{strength} {decision}":
+        strength = "MODERATE"
+        regime_msg = f" (Downgraded due to Bearish {market_type} Market)"
+        if market_type == "US": regime_msg = " (Downgraded: SPY < SMA200)"
+        if market_type == "India": regime_msg = " (Downgraded: NIFTY < SMA200)"
+        
+    full_decision = f"{strength} {decision}{regime_msg}" if decision != "HOLD" else "HOLD"
+
+    details.sort(key=lambda x: x['Reliability'], reverse=True)
 
     return {
         "decision": full_decision,
-        "confidence": round(normalized_score, 1),
+        "confidence": round(normalized_score), # Round to whole number
         "current_price": current_price,
+        "warnings": warnings,
         "drivers": {
             "bullish": bullish_factors,
             "bearish": bearish_factors,
@@ -399,45 +501,57 @@ def lookup_ticker(query, market_type="US"):
     """
     Attempts to find a ticker symbol from a company name query based on market type.
     """
-    query = query.strip().upper()
+    query = query.strip()
+    q_upper = query.upper()
     
-    # Direct overrides for Commodities (Yahoo Finance symbols)
+    # Direct overrides
     COMMODITIES = {
-        "GOLD": "GC=F",
-        "SILVER": "SI=F",
-        "CRUDE OIL": "CL=F",
-        "BRENT OIL": "BZ=F",
-        "NATURAL GAS": "NG=F",
-        "COPPER": "HG=F",
-        "PLATINUM": "PL=F"
+        "GOLD": "GC=F", "SILVER": "SI=F", "CRUDE OIL": "CL=F", "BRENT OIL": "BZ=F",
+        "NATURAL GAS": "NG=F", "COPPER": "HG=F", "PLATINUM": "PL=F"
     }
-    
-    # Direct overrides for Crypto
     CRYPTO = {
-        "BITCOIN": "BTC-USD",
-        "ETHEREUM": "ETH-USD",
-        "DOGECOIN": "DOGE-USD",
-        "SOLANA": "SOL-USD",
-        "RIPPLE": "XRP-USD",
-        "CARDANO": "ADA-USD"
+        "BITCOIN": "BTC-USD", "ETHEREUM": "ETH-USD", "DOGECOIN": "DOGE-USD",
+        "SOLANA": "SOL-USD", "RIPPLE": "XRP-USD", "CARDANO": "ADA-USD",
+        "BNB": "BNB-USD", "TETHER": "USDT-USD"
     }
 
-    if market_type == "Commodities" and query in COMMODITIES:
-        return COMMODITIES[query]
+    if market_type == "Commodities" and q_upper in COMMODITIES:
+        return COMMODITIES[q_upper]
     
     if market_type == "Crypto":
-        if query in CRYPTO: return CRYPTO[query]
-        if not query.endswith("-USD"): return f"{query}-USD"
-        return query
+        if q_upper in CRYPTO: return CRYPTO[q_upper]
+        if not q_upper.endswith("-USD") and " " not in query: return f"{q_upper}-USD"
+        # If space, fall through to search
 
-    # Heuristic: If it looks like a ticker, return it
-    if " " not in query and (len(query) <= 8 or "." in query):
-        if market_type == "India":
-            if not query.endswith(".NS") and not query.endswith(".BO"):
-                return f"{query}.NS" # Default to NSE
-        return query
+    # --- HEURISTIC CHECK ---
+    # If it looks like a ticker, return it immediately to save time
+    is_likely_ticker = False
+    
+    # Condition A: It is already uppercase and no spaces (e.g. AAPL, TSLA)
+    if " " not in query and query.isupper():
+        is_likely_ticker = True
+    # Condition B: Contains explicit ticker chars like dot or number (e.g. BRK.B, 500123)
+    elif " " not in query and ("." in query or any(char.isdigit() for char in query)):
+        is_likely_ticker = True
+    # Condition C: Explicit suffix
+    elif query.lower().endswith(".ns") or query.lower().endswith(".bo"):
+        is_likely_ticker = True
         
-    # Search Fallback
+    if is_likely_ticker:
+        return q_upper
+
+    # --- SEARCH OVERRIDES ---
+    # Common big names manual fix (Optimization)
+    manual_map = {
+        "APPLE": "AAPL", "TESLA": "TSLA", "MICROSOFT": "MSFT", 
+        "GOOGLE": "GOOGL", "AMAZON": "AMZN", "NVIDIA": "NVDA", 
+        "META": "META", "NETFLIX": "NFLX", "RELIANCE": "RELIANCE.NS",
+        "TATA MOTORS": "TATAMOTORS.NS", "HDFC": "HDFCBANK.NS", "INFOSYS": "INFY.NS"
+    }
+    if q_upper in manual_map:
+        return manual_map[q_upper]
+
+    # --- SEARCH FALLBACK ---
     suffix_map = {
         "US": " stock symbol",
         "India": " share price nse ticker",
@@ -446,26 +560,46 @@ def lookup_ticker(query, market_type="US"):
     }
     
     search_query = f"{query} {suffix_map.get(market_type, 'stock symbol')}"
+    print(f"DEBUG: Searching for '{search_query}'...")
     
     try:
+        # Using DuckDuckGo Search
+        # Attempt 1: Look for parenthesis pattern (e.g. "Apple Inc. (AAPL)")
         results = DDGS().text(search_query, max_results=1)
         if results:
-            text = results[0]['title'] + " " + results[0]['body']
-            # Regex for Ticker inside parentheses e.g. (RELIANCE.NS)
+            title = results[0]['title'] 
+            body = results[0]['body']
+            combined_text = f"{title} {body}"
+            
             import re
-            match = re.search(r'\((?P<ticker>[A-Z0-9.-]+)\)', text)
+            # Pattern 1: (TICKER) - most common in search results
+            match = re.search(r'\(\s?(?P<ticker>[A-Z0-9.-]+)\s?\)', combined_text)
             if match:
-                 t = match.group('ticker')
-                 # Clean up common artifacts
-                 return t.replace(")", "").replace("(", "")
-    except:
-        pass
+                t = match.group('ticker')
+                # Clean up
+                t = t.replace("NYSE:", "").replace("NASDAQ:", "").strip()
+                if market_type == "India" and not t.endswith(".NS") and not t.endswith(".BO"):
+                     # Some results might just say RELIANCE without suffix
+                     return f"{t}.NS"
+                return t
+                
+            # Pattern 2: "Symbol: TICKER"
+            match_sym = re.search(r'Symbol:\s?(?P<ticker>[A-Z0-9.-]+)', combined_text, re.IGNORECASE)
+            if match_sym:
+                 t = match_sym.group('ticker')
+                 if market_type == "India" and not t.endswith(".NS"): return f"{t}.NS"
+                 return t
+
+    except Exception as e:
+        print(f"Lookup Warning: {e}")
     
-    # Final Fallback
-    if market_type == "India":
-        return f"{query}.NS".replace(" ", "")
-    
-    return query
+    # Fallback if search fails but it was a single word
+    if " " not in query:
+        if market_type == "India":
+            return f"{q_upper}.NS"
+        return q_upper
+        
+    return q_upper
 
 def find_similar_pattern(df, n_candles=60):
     """
@@ -562,12 +696,12 @@ def get_market_news(ticker):
         print(f"News error: {e}")
         return []
 
-def analyze_stock_comprehensive(ticker, period, interval, api_key=None):
+def analyze_stock_comprehensive(ticker, period, interval, market_type="US", api_key=None):
     df = fetch_data(ticker, period, interval)
     if df is None:
         return None, None, None, None, None
         
-    analysis_res = calculate_expert_score(df, interval)
+    analysis_res = calculate_expert_score(df, interval, market_type)
     
     # Pattern Match
     pattern_info, pattern_df = find_similar_pattern(df)
@@ -598,102 +732,126 @@ def backtest_stock(df, initial_capital=10000):
     except:
         return None
 
-    capital = initial_capital
-    position = 0 # 0 = Flat, >0 = Number of shares
-    entry_price = 0
+    # Signal Generation (Simulated at T-1 Close for execution at T Open)
+    # 1. Check Sufficiency
+    if len(df) < 50:
+         return {
+            "status": "Insufficient Data (<50 candles)",
+            "win_rate": 0, "total_return": 0, "total_trades": 0, "max_drawdown": 0, "sharpe_ratio": 0
+        }
+
+    # 2. Prepare Vectorized Columns (Subset first to avoid dropping rows due to unused indicators like SMA200)
+    # We only need Open, Close, SMA_50, MACD, Signal
+    req_cols = ['Open', 'Close', 'SMA_50', 'MACD_12_26_9', 'MACDs_12_26_9']
     
-    trades = [] # List of {entry_date, entry_price, exit_date, exit_price, profit, return_pct}
+    # Check if they exist
+    for c in req_cols:
+        if c not in df.columns:
+            return {
+                "status": f"Missing Indicator: {c}",
+                "win_rate": 0, "total_return": 0, "total_trades": 0, "max_drawdown": 0, "sharpe_ratio": 0
+            }
+            
+    df_bt = df[req_cols].copy()
+    
+    # Create shifted columns for T-1 Logic
+    df_bt['Prev_MACD'] = df_bt['MACD_12_26_9'].shift(1)
+    df_bt['Prev_Signal'] = df_bt['MACDs_12_26_9'].shift(1)
+    df_bt['Prev2_MACD'] = df_bt['MACD_12_26_9'].shift(2)
+    df_bt['Prev2_Signal'] = df_bt['MACDs_12_26_9'].shift(2)
+    df_bt['Prev_Close'] = df_bt['Close'].shift(1)
+    df_bt['Prev_SMA50'] = df_bt['SMA_50'].shift(1)
+    
+    # Now Safe Drop
+    df_bt.dropna(inplace=True)
+    
+    if len(df_bt) < 30:
+        return {
+            "status": "Insufficient Data (After dropping NaNs)",
+            "win_rate": 0, "total_return": 0, "total_trades": 0, "max_drawdown": 0, "sharpe_ratio": 0
+        }
+
+    capital = initial_capital
+    position = 0
+    entry_price = 0
+
+    trades = [] 
     equity_curve = [initial_capital]
     
-    # We ignore the last candle as it might be incomplete/current
-    # We iterate through the dataframe. 
-    # NOTE: vectorized backtesting is faster, but looping allows for complex "state" (e.g. holding)
+    # Vectorized logic is tricky with state (holding vs not).
+    # We use a loop on the clean dataset.
     
-    # Signals
-    # SMA 50 as trend filter. MACD as momentum trigger.
-    # Logic: Only buy if Trend is UP (Price > SMA50) AND Momentum shifts UP (MACD > Signal)
+    opens = df_bt['Open'].values
+    prev_macds = df_bt['Prev_MACD'].values
+    prev_sigs = df_bt['Prev_Signal'].values
+    prev2_macds = df_bt['Prev2_MACD'].values
+    prev2_sigs = df_bt['Prev2_Signal'].values
+    prev_closes = df_bt['Prev_Close'].values
+    prev_smas = df_bt['Prev_SMA50'].values
+    dates = df_bt.index
     
-    sma_col = 'SMA_50'
-    macd_col = 'MACD_12_26_9'
-    sig_col = 'MACDs_12_26_9'
-    close_col = 'Close'
-    dates = df.index
-    
-    # Pre-fetch numpy arrays for speed and precision
-    closes = df[close_col].values
-    smas = df[sma_col].values
-    macds = df[macd_col].values
-    sigs = df[sig_col].values
-    
-    for i in range(1, len(df) - 1):
-        price = closes[i]
-        date = dates[i]
+    for i in range(len(df_bt)):
+        current_date = dates[i]
+        execution_price = opens[i] # Trade at Open
         
-        # Skip if NaN
-        if pd.isna(smas[i]) or pd.isna(macds[i]):
-            continue
-            
-        # BUY SIGNAL
+        # Strategy Logic:
+        # BUY IF: at Prev Close, Price > SMA50 AND MACD Crossed Above Signal
+        
+        # Check Crossover occurred at T-1
+        # (Prev_MACD > Prev_Signal) AND (Prev2_MACD <= Prev2_Signal)
+        bullish_cross = (prev_macds[i] > prev_sigs[i]) and (prev2_macds[i] <= prev2_sigs[i])
+        trend_up = prev_closes[i] > prev_smas[i]
+        
         if position == 0:
-            # Trend Filter: Price > SMA 50
-            # Trigger: MACD crosses above Signal (Bullish Crossover)
-            # We check if MACD[i] > Sig[i] AND MACD[i-1] <= Sig[i-1]
-            bullish_cross = macds[i] > sigs[i] and macds[i-1] <= sigs[i-1]
-            trend_up = price > smas[i]
-            
             if bullish_cross and trend_up:
-                position = capital / price
-                entry_price = price
-                entry_date = date
-                capital = 0 # All in
+                position = capital / execution_price
+                entry_price = execution_price
+                entry_date = current_date
+                capital = 0 
                 
-        # SELL SIGNAL
         elif position > 0:
-            # Exit when Momentum dies (MACD crosses below Signal) OR Stop Loss
-            bearish_cross = macds[i] < sigs[i] and macds[i-1] >= sigs[i-1]
+            # SELL IF: at Prev Close, MACD Crossed Below Signal
+            bearish_cross = (prev_macds[i] < prev_sigs[i]) and (prev2_macds[i] >= prev2_sigs[i])
             
             if bearish_cross:
-                revenue = position * price
-                profit = revenue - (position * entry_price)
-                pct_change = ((price - entry_price) / entry_price) * 100
+                revenue = position * execution_price
+                
+                # Transaction Cost (0.1% Slippage/Clerical Fees)
+                raw_pct = ((execution_price - entry_price) / entry_price) * 100
+                pct_change = raw_pct - 0.1
+                
+                # Adjust absolute profit (approx)
+                cost = (position * entry_price) * 0.001
+                profit = revenue - (position * entry_price) - cost 
                 
                 trades.append({
                     "entry_date": entry_date,
                     "entry_price": entry_price,
-                    "exit_date": date,
-                    "exit_price": price,
+                    "exit_date": current_date,
+                    "exit_price": execution_price,
                     "profit": profit,
                     "return_pct": pct_change
                 })
                 
                 capital = revenue
                 position = 0
-                
-        # Update Equity Curve (Mark to Market)
-        current_equity = capital if position == 0 else (position * price)
-        equity_curve.append(current_equity)
-
-    # Metrics Calculation
-    if not trades:
-        return {
-            "win_rate": 0,
-            "total_return": 0,
-            "total_trades": 0,
-            "max_drawdown": 0,
-            "best_trade": None,
-            "status": "No historical trades found with this strategy."
-        }
         
-    wins = [t for t in trades if t['profit'] > 0]
-    losses = [t for t in trades if t['profit'] <= 0]
+        # Mark to Market (using Close of current day)
+        current_val = capital if position == 0 else (position * df_bt['Close'].iloc[i])
+        equity_curve.append(current_val)
+        
+    # --- METRICS ---
+    if not trades:
+         return {
+            "win_rate": 0, "total_return": 0, "total_trades": 0, "max_drawdown": 0, "sharpe_ratio": 0,
+            "status": "No Trades Triggered"
+        }
+
+    trades_df = pd.DataFrame(trades)
+    win_rate = (len(trades_df[trades_df['profit'] > 0]) / len(trades_df)) * 100
+    total_return = ((equity_curve[-1] - initial_capital) / initial_capital) * 100
     
-    win_rate = (len(wins) / len(trades)) * 100
-    
-    # Calculate Total Return
-    final_equity = equity_curve[-1]
-    total_return_pct = ((final_equity - initial_capital) / initial_capital) * 100
-    
-    # Max Drawdown
+    # Max DD
     peak = initial_capital
     max_dd = 0
     for val in equity_curve:
@@ -701,17 +859,30 @@ def backtest_stock(df, initial_capital=10000):
         dd = (peak - val) / peak
         if dd > max_dd: max_dd = dd
         
-    max_drawdown_pct = max_dd * 100
+    # Sharpe Ratio (Daily Returns)
+    equity_series = pd.Series(equity_curve)
+    daily_returns = equity_series.pct_change().dropna()
     
-    # Best Scenario
-    best_trade = max(trades, key=lambda x: x['return_pct']) if trades else None
+    risk_free_daily = 0.04 / 252 # 4% Annual
+    excess_returns = daily_returns - risk_free_daily
     
+    if excess_returns.std() > 0:
+        sharpe = (excess_returns.mean() / excess_returns.std()) * (252**0.5)
+    else:
+        sharpe = 0
+        
+    warning = ""
+    if len(trades) < 30:
+        warning = "⚠️ Low Statistical Significance (N < 30)"
+
     return {
-        "win_rate": round(win_rate, 1),
-        "total_return": round(total_return_pct, 1),
+        "win_rate": round(win_rate, 0),
+        "total_return": round(total_return, 1),
         "total_trades": len(trades),
-        "max_drawdown": round(max_drawdown_pct, 1),
-        "avg_profit": round(pd.DataFrame(trades)['return_pct'].mean(), 1),
-        "best_trade": best_trade,
+        "max_drawdown": round(max_dd * 100, 1),
+        "avg_profit": round(trades_df['return_pct'].mean(), 1),
+        "best_trade": max(trades, key=lambda x: x['return_pct']),
+        "sharpe_ratio": round(sharpe, 2),
+        "warning": warning,
         "status": "Active"
     }

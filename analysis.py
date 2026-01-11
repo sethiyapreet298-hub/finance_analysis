@@ -1,7 +1,11 @@
 import yfinance as yf
 import pandas as pd
 import pandas_ta as ta
-from duckduckgo_search import DDGS
+try:
+    from duckduckgo_search import DDGS
+except ImportError:
+    DDGS = None
+
 import google.generativeai as genai
 import datetime
 
@@ -564,6 +568,10 @@ def lookup_ticker(query, market_type="US"):
     
     try:
         # Using DuckDuckGo Search
+        if DDGS is None:
+            print("Warning: duckduckgo_search not installed or failed to import.")
+            return q_upper
+
         # Attempt 1: Look for parenthesis pattern (e.g. "Apple Inc. (AAPL)")
         results = DDGS().text(search_query, max_results=1)
         if results:
